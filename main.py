@@ -32,14 +32,14 @@ if "messages" not in st.session_state:
 # ============================================================
 # 标题 & 侧边栏
 # ============================================================
-st.title("💬 DeepSeek Chat")
+st.title("DeepSeek Chat")
 
 with st.sidebar:
     st.markdown("### ⚙️ 设置")
 
     model = st.selectbox(
         "模型",
-        ["deepseek-v4", "deepseek-v4-flash"],
+        ["deepseek-v4-flash", "deepseek-v4-pro"],
         index=1,
     )
     temperature = st.slider("Temperature", 0.0, 2.0, 1.0, 0.1)
