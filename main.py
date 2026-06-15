@@ -3,6 +3,12 @@ import os
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.messages.base import BaseMessage
+from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.runnables import RunnableParallel
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+from operator import itemgetter
 import math
 from collections import Counter
 
@@ -67,56 +73,56 @@ RAG_KNOWLEDGE = [
 ]
 
 
-class RAGRetriever:
-    """BM25 检索器 —— 纯 Python 实现，无需外部向量数据库或嵌入模型。"""
+class RAGRetriever(BaseRetriever):
+    """BM25 检索器 —— 继承 LangChain BaseRetriever，支持在 LCEL 链中直接使用。"""
 
-    def __init__(self, documents: list[str]):
-        self.documents = documents
-        self.corpus_size = len(documents)
-        self.doc_freqs: dict[str, int] = {}
-        self.doc_lengths: list[int] = []
-        self.tokenized_docs: list[list[str]] = []
+    documents: list[str]
+    top_k: int = 3
+
+    def __init__(self, documents: list[str], **kwargs):
+        super().__init__(documents=documents, **kwargs)
+        # 预处理：分词并统计文档频率
+        self._doc_freqs: dict[str, int] = {}
+        self._doc_lengths: list[int] = []
+        self._tokenized_docs: list[list[str]] = []
 
         for doc in documents:
             tokens = doc.lower().split()
-            self.tokenized_docs.append(tokens)
-            self.doc_lengths.append(len(tokens))
+            self._tokenized_docs.append(tokens)
+            self._doc_lengths.append(len(tokens))
             for token in set(tokens):
-                self.doc_freqs[token] = self.doc_freqs.get(token, 0) + 1
+                self._doc_freqs[token] = self._doc_freqs.get(token, 0) + 1
 
-        self.avg_doc_length = (
-            sum(self.doc_lengths) / self.corpus_size if self.corpus_size else 0.0
+        self._avg_doc_len = (
+            sum(self._doc_lengths) / len(self.documents) if self.documents else 0.0
         )
 
-    def retrieve(self, query: str, top_k: int = 3) -> list[int]:
-        """检索与查询最相关的文档，返回文档索引列表（按相关性降序）。"""
+    def _get_relevant_documents(self, query: str) -> list[Document]:
+        """BaseRetriever 接口：根据文本查询返回 Document 列表。"""
         query_tokens = query.lower().split()
         if not query_tokens:
             return []
 
+        N = len(self.documents)
+        k1, b = 1.5, 0.75
         scores: list[tuple[float, int]] = []
-        for i in range(self.corpus_size):
-            score = self._bm25_score(query_tokens, self.tokenized_docs[i], self.doc_lengths[i])
+
+        for i in range(N):
+            term_counts = Counter(self._tokenized_docs[i])
+            score = 0.0
+            for token in query_tokens:
+                if token not in self._doc_freqs:
+                    continue
+                tf = term_counts.get(token, 0)
+                if tf == 0:
+                    continue
+                n = self._doc_freqs[token]
+                idf = math.log((N - n + 0.5) / (n + 0.5) + 1.0)
+                score += idf * (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * self._doc_lengths[i] / self._avg_doc_len))
             scores.append((score, i))
 
         scores.sort(key=lambda x: x[0], reverse=True)
-        return [idx for _, idx in scores[:top_k]]
-
-    def _bm25_score(self, query_tokens: list[str], doc_tokens: list[str], doc_len: int) -> float:
-        """BM25 相似度计算。"""
-        k1, b = 1.5, 0.75
-        term_counts = Counter(doc_tokens)
-        score = 0.0
-        for token in query_tokens:
-            if token not in self.doc_freqs:
-                continue
-            tf = term_counts.get(token, 0)
-            if tf == 0:
-                continue
-            n = self.doc_freqs[token]
-            idf = math.log((self.corpus_size - n + 0.5) / (n + 0.5) + 1.0)
-            score += idf * (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * doc_len / self.avg_doc_length))
-        return score
+        return [Document(page_content=self.documents[idx]) for _, idx in scores[:self.top_k]]
 
 
 # 初始化对话历史
@@ -243,13 +249,6 @@ if prompt := st.chat_input("输入你的问题..."):
     with st.chat_message("user"):
         st.markdown(user_text)
 
-    # RAG 检索增强：从知识库中检索与用户问题相关的文档
-    if st.session_state.rag_enabled:
-        relevant_indices = st.session_state.rag_retriever.retrieve(user_text, top_k=st.session_state.rag_top_k)
-        st.session_state.rag_docs = [(i, RAG_KNOWLEDGE[i]) for i in relevant_indices]
-    else:
-        st.session_state.rag_docs = []
-
     # 构建 LLM
     llm = ChatOpenAI(
         api_key=DEEPSEEK_API_KEY,  # type: ignore[arg-type]
@@ -260,36 +259,87 @@ if prompt := st.chat_input("输入你的问题..."):
         streaming=True,
     )
 
-    # 准备 LLM 消息（启用 RAG 时注入检索到的上下文作为 SystemMessage）
-    if st.session_state.rag_docs:
-        context_lines = ["以下是与用户问题相关的参考信息，请据此回答：\n"]
-        for j, (orig_idx, doc) in enumerate(st.session_state.rag_docs):
-            context_lines.append(f"--- 文档 {j+1} ---\n{doc}")
-        context_text = "\n\n".join(context_lines)
-        llm_messages = list(st.session_state.messages)
-        llm_messages.insert(-1, SystemMessage(content=context_text))
-    else:
-        llm_messages = st.session_state.messages
-
-    # 流式响应（手动处理，避免类型推断问题）
+    # ============================================================
+    # 流式响应（RAG 链式写法 vs 普通模式）
+    # ============================================================
     with st.chat_message("assistant"):
-        # 展示检索到的文档
-        if st.session_state.rag_docs:
-            with st.expander(f"📚 检索到 {len(st.session_state.rag_docs)} 篇相关知识", expanded=False):
-                for j, (orig_idx, doc) in enumerate(st.session_state.rag_docs):
-                    st.markdown(f"**来源 {j+1}:**\n{doc}")
-                    if j < len(st.session_state.rag_docs) - 1:
-                        st.markdown("---")
+        # ---- 检索知识库并展示（仅 RAG 模式） ----
+        if st.session_state.rag_enabled:
+            retriever = st.session_state.rag_retriever
+            retriever.top_k = st.session_state.rag_top_k
+            retrieved_docs = retriever.invoke(user_text)
+            st.session_state.rag_docs = [(i, doc.page_content) for i, doc in enumerate(retrieved_docs)]
+            if st.session_state.rag_docs:
+                with st.expander(f"📚 检索到 {len(st.session_state.rag_docs)} 篇相关知识", expanded=False):
+                    for j, (_, doc) in enumerate(st.session_state.rag_docs):
+                        st.markdown(f"**来源 {j+1}:**\n{doc}")
+                        if j < len(st.session_state.rag_docs) - 1:
+                            st.markdown("---")
+        else:
+            st.session_state.rag_docs = []
 
         message_placeholder = st.empty()
         full_response = ""
 
         with st.spinner("思考中..."):
             try:
-                for chunk in llm.stream(llm_messages):
-                    content = chunk.content if isinstance(chunk.content, str) else ""
-                    full_response += content
-                    message_placeholder.markdown(full_response + "▌")
+                if st.session_state.rag_enabled:
+                    # ============================================================
+                    # 链式写法（LCEL — LangChain Expression Language）
+                    #
+                    #   question                        ← 用户输入
+                    #     │
+                    #     ├─ retriever  ──→ 检索知识库，找出相关文档
+                    #     ├─ format_docs ──→ Document 列表 → 纯文本
+                    #     │
+                    #     ▼
+                    #   ChatPromptTemplate              ← 组装 system + 历史 + 问题
+                    #     │
+                    #     ▼
+                    #   llm                             ← DeepSeek 生成回答
+                    #     │
+                    #     ▼
+                    #   StrOutputParser                 ← 提取文本流
+                    #
+                    # 相当于一行伪代码：
+                    #   链 = (提取问题 → 检索 → 格式化) | 组装提示词 | 大模型 | 解析输出
+                    # ============================================================
+
+                    def format_docs(docs: list[Document]) -> str:
+                        """将 Document 列表拼接成纯文本上下文。"""
+                        return "\n\n".join(doc.page_content for doc in docs)
+
+                    rag_chain = (
+                        RunnableParallel(
+                            {
+                                "context": itemgetter("question") | retriever | format_docs,
+                                "question": itemgetter("question"),
+                                "history": itemgetter("history"),
+                                "system_prompt": itemgetter("system_prompt"),
+                            }
+                        )
+                        | ChatPromptTemplate.from_messages([
+                            ("system", "{system_prompt}\n\n以下是与用户问题相关的参考信息：\n{context}"),
+                            MessagesPlaceholder(variable_name="history"),
+                            ("human", "{question}"),
+                        ])
+                        | llm
+                        | StrOutputParser()
+                    )
+
+                    for chunk in rag_chain.stream({
+                        "question": user_text,
+                        "history": st.session_state.messages[1:-1],  # 排除 system 和当前提问
+                        "system_prompt": st.session_state.messages[0].content if st.session_state.messages else "你是一个有帮助的助手。",
+                    }):
+                        full_response += chunk
+                        message_placeholder.markdown(full_response + "▌")
+                else:
+                    # 普通模式：直接传递全部消息给 LLM
+                    for chunk in llm.stream(st.session_state.messages):
+                        content = chunk.content if isinstance(chunk.content, str) else ""
+                        full_response += content
+                        message_placeholder.markdown(full_response + "▌")
 
                 message_placeholder.markdown(full_response)
                 st.session_state.messages.append(AIMessage(content=full_response))
