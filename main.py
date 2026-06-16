@@ -72,8 +72,14 @@ def load_knowledge(filename: str) -> list[str]:
             entries.append(entry)
     return entries
 
-# ============================================================
-# 历史管理（RunnableWithMessageHistory 回调）
+
+def load_knowledge_batch(filenames: list[str]) -> list[str]:
+    """读取 rag_library 下多个 .txt 文件，合并返回知识条目列表。"""
+    all_entries: list[str] = []
+    for name in filenames:
+        all_entries.extend(load_knowledge(name))
+    return all_entries
+
 # ============================================================
 def get_session_history(session_id: str) -> ChatMessageHistory:
     """按 session_id 存取对话历史（框架自动调用）。"""
@@ -120,15 +126,18 @@ if "custom_prompt_text" not in st.session_state:
     st.session_state.custom_prompt_text = ""
 if "system_prompt_content" not in st.session_state:
     st.session_state.system_prompt_content = PROMPT_TEMPLATES["通用助手"]
-if "current_kb" not in st.session_state:
-    st.session_state.current_kb = "library.txt"
+if "selected_kbs" not in st.session_state:
+    st.session_state.selected_kbs = []
 if "rag_top_k" not in st.session_state:
     st.session_state.rag_top_k = 3
 if "rag_retriever" not in st.session_state:
-    st.session_state.rag_retriever = build_retriever(
-        load_knowledge(st.session_state.current_kb),
-        top_k=st.session_state.rag_top_k,
-    )
+    if st.session_state.selected_kbs:
+        st.session_state.rag_retriever = build_retriever(
+            load_knowledge_batch(st.session_state.selected_kbs),
+            top_k=st.session_state.rag_top_k,
+        )
+    else:
+        st.session_state.rag_retriever = None
 if "rag_enabled" not in st.session_state:
     st.session_state.rag_enabled = True
 if "rag_docs" not in st.session_state:
@@ -200,29 +209,31 @@ with st.sidebar:
         # 刷新知识库列表
         st.rerun()
 
-    # 知识库选择
+    # 知识库选择（多选）
     kb_list = list_knowledge_bases()
     if not kb_list:
         st.warning("rag_library/ 下没有 .txt 文件")
     else:
-        # 如果当前 KB 不在列表中（被删除等），切回第一个
-        if st.session_state.current_kb not in kb_list:
-            st.session_state.current_kb = kb_list[0]
+        # 过滤掉已不存在的文件
+        st.session_state.selected_kbs = [
+            kb for kb in st.session_state.selected_kbs if kb in kb_list
+        ]
 
-        selected_kb = st.selectbox(
-            "选择知识库",
+        selected_kbs = st.multiselect(
+            "选择知识库（可多选）",
             kb_list,
-            index=kb_list.index(st.session_state.current_kb),
+            default=st.session_state.selected_kbs,
             key="kb_selector",
         )
 
-        # 切换知识库时重建检索器
-        if selected_kb != st.session_state.current_kb:
-            st.session_state.current_kb = selected_kb
-            st.session_state.rag_retriever = build_retriever(
-                load_knowledge(selected_kb),
-                top_k=st.session_state.rag_top_k,
-            )
+        # 选择变了就重建检索器
+        if sorted(selected_kbs) != sorted(st.session_state.selected_kbs):
+            st.session_state.selected_kbs = selected_kbs
+            if selected_kbs:
+                st.session_state.rag_retriever = build_retriever(
+                    load_knowledge_batch(selected_kbs),
+                    top_k=st.session_state.rag_top_k,
+                )
             st.rerun()
 
     rag_enabled = st.toggle("启用 RAG", value=st.session_state.rag_enabled, key="rag_toggle")
@@ -283,7 +294,7 @@ if prompt := st.chat_input("输入你的问题..."):
 
         with st.spinner("思考中..."):
             try:
-                if st.session_state.rag_enabled:
+                if st.session_state.rag_enabled and st.session_state.rag_retriever:
                     retriever = st.session_state.rag_retriever
                     retriever.search_kwargs["k"] = st.session_state.rag_top_k
 
