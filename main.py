@@ -48,26 +48,29 @@ PROMPT_TEMPLATES = {
 
 
 # ============================================================
-# RAG 知识库（从 library.txt 读取）
+# RAG 知识库（从 rag_library/ 读取）
 # ============================================================
-LIBRARY_PATH = os.path.join(os.path.dirname(__file__), "library.txt")
+RAG_LIBRARY_DIR = os.path.join(os.path.dirname(__file__), "rag_library")
 
 
-def load_knowledge(path: str = LIBRARY_PATH) -> list[str]:
-    """读取 library.txt，返回知识条目列表。"""
+def list_knowledge_bases() -> list[str]:
+    """列出 rag_library 下所有 .txt 文件。"""
+    os.makedirs(RAG_LIBRARY_DIR, exist_ok=True)
+    return sorted(f for f in os.listdir(RAG_LIBRARY_DIR) if f.endswith(".txt"))
+
+
+def load_knowledge(filename: str) -> list[str]:
+    """读取 rag_library 下某个 .txt 文件，返回知识条目列表。"""
+    path = os.path.join(RAG_LIBRARY_DIR, filename)
     entries: list[str] = []
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            # 去掉外层引号和尾部的逗号
             entry = line.strip('"').rstrip(",")
             entries.append(entry)
     return entries
-
-
-RAG_KNOWLEDGE = load_knowledge()
 
 # ============================================================
 # 历史管理（RunnableWithMessageHistory 回调）
@@ -80,16 +83,6 @@ def get_session_history(session_id: str) -> ChatMessageHistory:
         st.session_state.history_store[session_id] = ChatMessageHistory()
     return st.session_state.history_store[session_id]
 
-
-# 初始化
-if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4())
-if "current_prompt" not in st.session_state:
-    st.session_state.current_prompt = "通用助手"
-if "custom_prompt_text" not in st.session_state:
-    st.session_state.custom_prompt_text = ""
-if "system_prompt_content" not in st.session_state:
-    st.session_state.system_prompt_content = PROMPT_TEMPLATES["通用助手"]
 
 class LocalEmbeddings(Embeddings):
     """适配本地 OpenAI 兼容 embedding API 的包装器。"""
@@ -105,24 +98,39 @@ class LocalEmbeddings(Embeddings):
         return self.embed_documents([text])[0]
 
 
-# 初始化 Chroma 向量检索器
-if "rag_retriever" not in st.session_state:
+def build_retriever(knowledge: list[str], top_k: int = 3):
+    """根据知识条目列表构建 Chroma 向量检索器。"""
     embeddings = LocalEmbeddings(
         model="text-embedding-qwen3-embedding-4b",
         base_url="http://127.0.0.1:1234/v1",
     )
-    vectorstore = Chroma.from_texts(
-        texts=RAG_KNOWLEDGE,
-        embedding=embeddings,
-    )
-    st.session_state.rag_retriever = vectorstore.as_retriever(
+    vectorstore = Chroma.from_texts(texts=knowledge, embedding=embeddings)
+    return vectorstore.as_retriever(
         search_type="similarity",
-        search_kwargs={"k": st.session_state.rag_top_k},
+        search_kwargs={"k": top_k},
+    )
+
+
+# 初始化 session state
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+if "current_prompt" not in st.session_state:
+    st.session_state.current_prompt = "通用助手"
+if "custom_prompt_text" not in st.session_state:
+    st.session_state.custom_prompt_text = ""
+if "system_prompt_content" not in st.session_state:
+    st.session_state.system_prompt_content = PROMPT_TEMPLATES["通用助手"]
+if "current_kb" not in st.session_state:
+    st.session_state.current_kb = "library.txt"
+if "rag_top_k" not in st.session_state:
+    st.session_state.rag_top_k = 3
+if "rag_retriever" not in st.session_state:
+    st.session_state.rag_retriever = build_retriever(
+        load_knowledge(st.session_state.current_kb),
+        top_k=st.session_state.rag_top_k,
     )
 if "rag_enabled" not in st.session_state:
     st.session_state.rag_enabled = True
-if "rag_top_k" not in st.session_state:
-    st.session_state.rag_top_k = 3
 if "rag_docs" not in st.session_state:
     st.session_state.rag_docs = []
 
@@ -177,6 +185,46 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 📚 RAG 检索增强")
+
+    # 知识库文件上传
+    uploaded_file = st.file_uploader(
+        "上传 .txt 知识库",
+        type="txt",
+        key="rag_uploader",
+    )
+    if uploaded_file:
+        save_path = os.path.join(RAG_LIBRARY_DIR, uploaded_file.name)
+        with open(save_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        st.success(f"已保存 {uploaded_file.name}")
+        # 刷新知识库列表
+        st.rerun()
+
+    # 知识库选择
+    kb_list = list_knowledge_bases()
+    if not kb_list:
+        st.warning("rag_library/ 下没有 .txt 文件")
+    else:
+        # 如果当前 KB 不在列表中（被删除等），切回第一个
+        if st.session_state.current_kb not in kb_list:
+            st.session_state.current_kb = kb_list[0]
+
+        selected_kb = st.selectbox(
+            "选择知识库",
+            kb_list,
+            index=kb_list.index(st.session_state.current_kb),
+            key="kb_selector",
+        )
+
+        # 切换知识库时重建检索器
+        if selected_kb != st.session_state.current_kb:
+            st.session_state.current_kb = selected_kb
+            st.session_state.rag_retriever = build_retriever(
+                load_knowledge(selected_kb),
+                top_k=st.session_state.rag_top_k,
+            )
+            st.rerun()
+
     rag_enabled = st.toggle("启用 RAG", value=st.session_state.rag_enabled, key="rag_toggle")
     st.session_state.rag_enabled = rag_enabled
     if rag_enabled:
