@@ -1,16 +1,22 @@
-import streamlit as st
 import os
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_core.messages.base import BaseMessage
-from langchain_core.documents import Document
-from langchain_core.runnables import RunnableParallel
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.embeddings import Embeddings
+import uuid
+
+import streamlit as st
 from langchain_chroma import Chroma
+from langchain_classic.chains import (
+    create_history_aware_retriever,
+    create_retrieval_chain,
+)
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.embeddings import Embeddings
+from langchain_core.messages import HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.config import RunnableConfig
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_openai import ChatOpenAI
 from openai import OpenAI as OpenAIClient
-from operator import itemgetter
 
 # ============================================================
 # 页面配置
@@ -72,17 +78,27 @@ RAG_KNOWLEDGE = [
     "风语者联邦的首都云顶城建造在悬浮的巨石上，依靠风岚魔法维持浮空。城中有全大陆最大的图书馆，藏有从第一纪元至今的几乎所有已知文献。"
 ]
 
-# 初始化对话历史
-initial_messages: list[BaseMessage] = [
-    SystemMessage(content=PROMPT_TEMPLATES["通用助手"])
-]
-if "messages" not in st.session_state:
-    st.session_state.messages = initial_messages
+# ============================================================
+# 历史管理（RunnableWithMessageHistory 回调）
+# ============================================================
+def get_session_history(session_id: str) -> ChatMessageHistory:
+    """按 session_id 存取对话历史（框架自动调用）。"""
+    if "history_store" not in st.session_state:
+        st.session_state.history_store = {}
+    if session_id not in st.session_state.history_store:
+        st.session_state.history_store[session_id] = ChatMessageHistory()
+    return st.session_state.history_store[session_id]
+
+
+# 初始化
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
 if "current_prompt" not in st.session_state:
     st.session_state.current_prompt = "通用助手"
-# 自定义 prompt 暂存
 if "custom_prompt_text" not in st.session_state:
     st.session_state.custom_prompt_text = ""
+if "system_prompt_content" not in st.session_state:
+    st.session_state.system_prompt_content = PROMPT_TEMPLATES["通用助手"]
 
 class LocalEmbeddings(Embeddings):
     """适配本地 OpenAI 兼容 embedding API 的包装器。"""
@@ -162,12 +178,9 @@ with st.sidebar:
             st.text(system_content)
 
     # 如果 prompt 变了，更新 system message
-    current_system = st.session_state.messages[0].content if st.session_state.messages else ""
-    if system_content != current_system:
+    if system_content != st.session_state.system_prompt_content:
         if st.button("🔄 应用此 Prompt", use_container_width=True, type="primary"):
-            st.session_state.messages = [
-                SystemMessage(content=system_content)
-            ]
+            st.session_state.system_prompt_content = system_content
             st.session_state.current_prompt = selected_prompt_name
             st.rerun()
 
@@ -184,17 +197,12 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     with col1:
         if st.button("🗑️ 清空对话", use_container_width=True):
-            # 保留当前的 system prompt
-            current_system = st.session_state.messages[0].content if st.session_state.messages else PROMPT_TEMPLATES["通用助手"]
-            st.session_state.messages = [
-                SystemMessage(content=current_system)
-            ]
+            get_session_history(st.session_state.session_id).clear()
             st.rerun()
     with col2:
         if st.button("❌ 清空 + 重置 Prompt", use_container_width=True):
-            st.session_state.messages = [
-                SystemMessage(content=PROMPT_TEMPLATES["通用助手"])
-            ]
+            get_session_history(st.session_state.session_id).clear()
+            st.session_state.system_prompt_content = PROMPT_TEMPLATES["通用助手"]
             st.session_state.current_prompt = "通用助手"
             st.rerun()
 
@@ -202,11 +210,9 @@ with st.sidebar:
     st.caption("Powered by LangChain + DeepSeek")
 
 # ============================================================
-# 显示历史消息
+# 显示历史消息（从 ChatMessageHistory 读取）
 # ============================================================
-for msg in st.session_state.messages:
-    if isinstance(msg, SystemMessage):
-        continue
+for msg in get_session_history(st.session_state.session_id).messages:
     role = "user" if isinstance(msg, HumanMessage) else "assistant"
     with st.chat_message(role):
         st.markdown(msg.content)
@@ -215,9 +221,7 @@ for msg in st.session_state.messages:
 # 聊天输入
 # ============================================================
 if prompt := st.chat_input("输入你的问题..."):
-    # 显示用户消息
     user_text = str(prompt)
-    st.session_state.messages.append(HumanMessage(content=user_text))
     with st.chat_message("user"):
         st.markdown(user_text)
 
@@ -232,14 +236,27 @@ if prompt := st.chat_input("输入你的问题..."):
     )
 
     # ============================================================
-    # 流式响应（RAG 链式写法 vs 普通模式）
+    # 流式响应（RunnableWithMessageHistory 管理历史）
     # ============================================================
     with st.chat_message("assistant"):
         # ---- 检索知识库并展示（仅 RAG 模式） ----
         if st.session_state.rag_enabled:
             retriever = st.session_state.rag_retriever
             retriever.search_kwargs["k"] = st.session_state.rag_top_k
-            retrieved_docs = retriever.invoke(user_text)
+
+            history = get_session_history(st.session_state.session_id)
+            rephrase_prompt = ChatPromptTemplate.from_messages([
+                ("system", "你是一个检索助手。根据对话历史将用户最新提问改写为可在知识库检索的独立问题，只输出改写结果。"),
+                MessagesPlaceholder(variable_name="chat_history"),
+                ("human", "{input}"),
+            ])
+            history_aware_retriever = create_history_aware_retriever(
+                llm, retriever, rephrase_prompt
+            )
+            retrieved_docs = history_aware_retriever.invoke({
+                "input": user_text,
+                "chat_history": history.messages,
+            })
             st.session_state.rag_docs = [(i, doc.page_content) for i, doc in enumerate(retrieved_docs)]
             if st.session_state.rag_docs:
                 with st.expander(f"📚 检索到 {len(st.session_state.rag_docs)} 篇相关知识", expanded=False):
@@ -257,64 +274,62 @@ if prompt := st.chat_input("输入你的问题..."):
             try:
                 if st.session_state.rag_enabled:
                     # ============================================================
-                    # 链式写法（LCEL — LangChain Expression Language）
-                    #
-                    #   question                        ← 用户输入
-                    #     │
-                    #     ├─ retriever  ──→ 检索知识库，找出相关文档
-                    #     ├─ format_docs ──→ Document 列表 → 纯文本
-                    #     │
-                    #     ▼
-                    #   ChatPromptTemplate              ← 组装 system + 历史 + 问题
-                    #     │
-                    #     ▼
-                    #   llm                             ← DeepSeek 生成回答
-                    #     │
-                    #     ▼
-                    #   StrOutputParser                 ← 提取文本流
-                    #
-                    # 相当于一行伪代码：
-                    #   链 = (提取问题 → 检索 → 格式化) | 组装提示词 | 大模型 | 解析输出
+                    # RAG 链 — 历史由 RunnableWithMessageHistory 自动管理
                     # ============================================================
+                    answer_prompt = ChatPromptTemplate.from_messages([
+                        ("system", "{system_prompt}\n\n以下是与用户问题相关的参考信息：\n{context}"),
+                        MessagesPlaceholder(variable_name="chat_history"),
+                        ("human", "{input}"),
+                    ])
+                    combine_docs_chain = create_stuff_documents_chain(llm, answer_prompt)
+                    retrieval_chain = create_retrieval_chain(
+                        history_aware_retriever, combine_docs_chain
+                    )
 
-                    def format_docs(docs: list[Document]) -> str:
-                        """将 Document 列表拼接成纯文本上下文。"""
-                        return "\n\n".join(doc.page_content for doc in docs)
+                    chain_with_history = RunnableWithMessageHistory(
+                        retrieval_chain,
+                        get_session_history,
+                        input_messages_key="input",
+                        history_messages_key="chat_history",
+                        output_messages_key="answer",
+                    )
 
-                    rag_chain = (
-                        RunnableParallel(
-                            {
-                                "context": itemgetter("question") | retriever | format_docs,
-                                "question": itemgetter("question"),
-                                "history": itemgetter("history"),
-                                "system_prompt": itemgetter("system_prompt"),
-                            }
-                        )
-                        | ChatPromptTemplate.from_messages([
-                            ("system", "{system_prompt}\n\n以下是与用户问题相关的参考信息：\n{context}"),
-                            MessagesPlaceholder(variable_name="history"),
-                            ("human", "{question}"),
+                    for chunk in chain_with_history.stream(
+                        {"input": user_text, "system_prompt": st.session_state.system_prompt_content},
+                        config=RunnableConfig(configurable={"session_id": st.session_state.session_id}),
+                    ):
+                        if answer := chunk.get("answer"):
+                            full_response += answer
+                            message_placeholder.markdown(full_response + "▌")
+                else:
+                    # ============================================================
+                    # 普通模式 — 历史由 RunnableWithMessageHistory 自动管理
+                    # ============================================================
+                    simple_chain = (
+                        ChatPromptTemplate.from_messages([
+                            ("system", "{system_prompt}"),
+                            MessagesPlaceholder(variable_name="chat_history"),
+                            ("human", "{input}"),
                         ])
                         | llm
                         | StrOutputParser()
                     )
 
-                    for chunk in rag_chain.stream({
-                        "question": user_text,
-                        "history": st.session_state.messages[1:-1],  # 排除 system 和当前提问
-                        "system_prompt": st.session_state.messages[0].content if st.session_state.messages else "你是一个有帮助的助手。",
-                    }):
+                    chain_with_history = RunnableWithMessageHistory(
+                        simple_chain,
+                        get_session_history,
+                        input_messages_key="input",
+                        history_messages_key="chat_history",
+                    )
+
+                    for chunk in chain_with_history.stream(
+                        {"input": user_text, "system_prompt": st.session_state.system_prompt_content},
+                        config=RunnableConfig(configurable={"session_id": st.session_state.session_id}),
+                    ):
                         full_response += chunk
-                        message_placeholder.markdown(full_response + "▌")
-                else:
-                    # 普通模式：直接传递全部消息给 LLM
-                    for chunk in llm.stream(st.session_state.messages):
-                        content = chunk.content if isinstance(chunk.content, str) else ""
-                        full_response += content
                         message_placeholder.markdown(full_response + "▌")
 
                 message_placeholder.markdown(full_response)
-                st.session_state.messages.append(AIMessage(content=full_response))
 
             except Exception as e:
                 st.error(f"请求失败: {e}")
