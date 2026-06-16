@@ -4,13 +4,13 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.messages.base import BaseMessage
 from langchain_core.documents import Document
-from langchain_core.retrievers import BaseRetriever
 from langchain_core.runnables import RunnableParallel
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.embeddings import Embeddings
+from langchain_chroma import Chroma
+from openai import OpenAI as OpenAIClient
 from operator import itemgetter
-import math
-from collections import Counter
 
 # ============================================================
 # 页面配置
@@ -69,61 +69,8 @@ RAG_KNOWLEDGE = [
 
     # ---- 地理与冒险 ----
     "迷雾深渊位于大陆最北端，是一道深不见底的巨大裂谷。传说谷底埋藏着第一纪元失落文明的遗产。无数冒险者曾试图探索深渊，但从未有人真正到达过谷底。",
-    "风语者联邦的首都云顶城建造在悬浮的巨石上，依靠风岚魔法维持浮空。城中有全大陆最大的图书馆，藏有从第一纪元至今的几乎所有已知文献。",
+    "风语者联邦的首都云顶城建造在悬浮的巨石上，依靠风岚魔法维持浮空。城中有全大陆最大的图书馆，藏有从第一纪元至今的几乎所有已知文献。"
 ]
-
-
-class RAGRetriever(BaseRetriever):
-    """BM25 检索器 —— 继承 LangChain BaseRetriever，支持在 LCEL 链中直接使用。"""
-
-    documents: list[str]
-    top_k: int = 3
-
-    def __init__(self, documents: list[str], **kwargs):
-        super().__init__(documents=documents, **kwargs)
-        # 预处理：分词并统计文档频率
-        self._doc_freqs: dict[str, int] = {}
-        self._doc_lengths: list[int] = []
-        self._tokenized_docs: list[list[str]] = []
-
-        for doc in documents:
-            tokens = doc.lower().split()
-            self._tokenized_docs.append(tokens)
-            self._doc_lengths.append(len(tokens))
-            for token in set(tokens):
-                self._doc_freqs[token] = self._doc_freqs.get(token, 0) + 1
-
-        self._avg_doc_len = (
-            sum(self._doc_lengths) / len(self.documents) if self.documents else 0.0
-        )
-
-    def _get_relevant_documents(self, query: str) -> list[Document]:
-        """BaseRetriever 接口：根据文本查询返回 Document 列表。"""
-        query_tokens = query.lower().split()
-        if not query_tokens:
-            return []
-
-        N = len(self.documents)
-        k1, b = 1.5, 0.75
-        scores: list[tuple[float, int]] = []
-
-        for i in range(N):
-            term_counts = Counter(self._tokenized_docs[i])
-            score = 0.0
-            for token in query_tokens:
-                if token not in self._doc_freqs:
-                    continue
-                tf = term_counts.get(token, 0)
-                if tf == 0:
-                    continue
-                n = self._doc_freqs[token]
-                idf = math.log((N - n + 0.5) / (n + 0.5) + 1.0)
-                score += idf * (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * self._doc_lengths[i] / self._avg_doc_len))
-            scores.append((score, i))
-
-        scores.sort(key=lambda x: x[0], reverse=True)
-        return [Document(page_content=self.documents[idx]) for _, idx in scores[:self.top_k]]
-
 
 # 初始化对话历史
 initial_messages: list[BaseMessage] = [
@@ -137,9 +84,34 @@ if "current_prompt" not in st.session_state:
 if "custom_prompt_text" not in st.session_state:
     st.session_state.custom_prompt_text = ""
 
-# 初始化 RAG 检索器
+class LocalEmbeddings(Embeddings):
+    """适配本地 OpenAI 兼容 embedding API 的包装器。"""
+    def __init__(self, model: str, base_url: str):
+        self.client = OpenAIClient(base_url=base_url, api_key="not-needed")
+        self.model = model
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        resp = self.client.embeddings.create(model=self.model, input=texts)
+        return [d.embedding for d in resp.data]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.embed_documents([text])[0]
+
+
+# 初始化 Chroma 向量检索器
 if "rag_retriever" not in st.session_state:
-    st.session_state.rag_retriever = RAGRetriever(RAG_KNOWLEDGE)
+    embeddings = LocalEmbeddings(
+        model="text-embedding-qwen3-embedding-4b",
+        base_url="http://127.0.0.1:1234/v1",
+    )
+    vectorstore = Chroma.from_texts(
+        texts=RAG_KNOWLEDGE,
+        embedding=embeddings,
+    )
+    st.session_state.rag_retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": st.session_state.rag_top_k},
+    )
 if "rag_enabled" not in st.session_state:
     st.session_state.rag_enabled = True
 if "rag_top_k" not in st.session_state:
@@ -266,7 +238,7 @@ if prompt := st.chat_input("输入你的问题..."):
         # ---- 检索知识库并展示（仅 RAG 模式） ----
         if st.session_state.rag_enabled:
             retriever = st.session_state.rag_retriever
-            retriever.top_k = st.session_state.rag_top_k
+            retriever.search_kwargs["k"] = st.session_state.rag_top_k
             retrieved_docs = retriever.invoke(user_text)
             st.session_state.rag_docs = [(i, doc.page_content) for i, doc in enumerate(retrieved_docs)]
             if st.session_state.rag_docs:
