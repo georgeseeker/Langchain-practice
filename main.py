@@ -230,40 +230,36 @@ if prompt := st.chat_input("输入你的问题..."):
     # 流式响应（RunnableWithMessageHistory 管理历史）
     # ============================================================
     with st.chat_message("assistant"):
-        # ---- 检索知识库并展示（仅 RAG 模式） ----
-        if st.session_state.rag_enabled:
-            retriever = st.session_state.rag_retriever
-            retriever.search_kwargs["k"] = st.session_state.rag_top_k
-
-            history = get_session_history(st.session_state.session_id)
-            rephrase_prompt = ChatPromptTemplate.from_messages([
-                ("system", "你是一个检索助手。根据对话历史将用户最新提问改写为可在知识库检索的独立问题，只输出改写结果。"),
-                MessagesPlaceholder(variable_name="chat_history"),
-                ("human", "{input}"),
-            ])
-            history_aware_retriever = create_history_aware_retriever(
-                llm, retriever, rephrase_prompt
-            )
-            retrieved_docs = history_aware_retriever.invoke({
-                "input": user_text,
-                "chat_history": history.messages,
-            })
-            st.session_state.rag_docs = [(i, doc.page_content) for i, doc in enumerate(retrieved_docs)]
-            if st.session_state.rag_docs:
-                with st.expander(f"📚 检索到 {len(st.session_state.rag_docs)} 篇相关知识", expanded=False):
-                    for j, (_, doc) in enumerate(st.session_state.rag_docs):
-                        st.markdown(f"**来源 {j+1}:**\n{doc}")
-                        if j < len(st.session_state.rag_docs) - 1:
-                            st.markdown("---")
-        else:
-            st.session_state.rag_docs = []
-
         message_placeholder = st.empty()
         full_response = ""
 
         with st.spinner("思考中..."):
             try:
                 if st.session_state.rag_enabled:
+                    retriever = st.session_state.rag_retriever
+                    retriever.search_kwargs["k"] = st.session_state.rag_top_k
+
+                    history = get_session_history(st.session_state.session_id)
+                    rephrase_prompt = ChatPromptTemplate.from_messages([
+                        ("system", "你是一个检索助手。根据对话历史将用户最新提问改写为可在知识库检索的独立问题，只输出改写结果。"),
+                        MessagesPlaceholder(variable_name="chat_history"),
+                        ("human", "{input}"),
+                    ])
+                    history_aware_retriever = create_history_aware_retriever(
+                        llm, retriever, rephrase_prompt
+                    )
+                    retrieved_docs = history_aware_retriever.invoke({
+                        "input": user_text,
+                        "chat_history": history.messages,
+                    })
+                    st.session_state.rag_docs = [(i, doc.page_content) for i, doc in enumerate(retrieved_docs)]
+                    if st.session_state.rag_docs:
+                        with st.expander(f"📚 检索到 {len(st.session_state.rag_docs)} 篇相关知识", expanded=False):
+                            for j, (_, doc) in enumerate(st.session_state.rag_docs):
+                                st.markdown(f"**来源 {j+1}:**\n{doc}")
+                                if j < len(st.session_state.rag_docs) - 1:
+                                    st.markdown("---")
+
                     # ============================================================
                     # RAG 链 — 历史由 RunnableWithMessageHistory 自动管理
                     # ============================================================
@@ -293,6 +289,7 @@ if prompt := st.chat_input("输入你的问题..."):
                             full_response += answer
                             message_placeholder.markdown(full_response + "▌")
                 else:
+                    st.session_state.rag_docs = []
                     # ============================================================
                     # 普通模式 — 历史由 RunnableWithMessageHistory 自动管理
                     # ============================================================
