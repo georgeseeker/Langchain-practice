@@ -142,6 +142,8 @@ if "rag_enabled" not in st.session_state:
     st.session_state.rag_enabled = True
 if "rag_docs" not in st.session_state:
     st.session_state.rag_docs = []
+if "deep_thinking" not in st.session_state:
+    st.session_state.deep_thinking = False
 
 # ============================================================
 # 标题 & 侧边栏
@@ -158,6 +160,8 @@ with st.sidebar:
     )
     temperature = st.slider("Temperature", 0.0, 2.0, 1.0, 0.1)
     max_tokens = st.slider("Max Tokens", 256, 8192, 2048, 256)
+    deep_thinking = st.toggle("🧠 深度思考", value=st.session_state.deep_thinking, key="deep_thinking_toggle")
+    st.session_state.deep_thinking = deep_thinking
 
     st.markdown("---")
     st.markdown("### 🤖 系统 Prompt")
@@ -276,7 +280,7 @@ if prompt := st.chat_input("输入你的问题..."):
         st.markdown(user_text)
 
     # 构建 LLM
-    llm = ChatOpenAI(
+    llm_kwargs = dict(
         api_key=DEEPSEEK_API_KEY,  # type: ignore[arg-type]
         base_url="https://api.deepseek.com",
         model=model,
@@ -284,6 +288,9 @@ if prompt := st.chat_input("输入你的问题..."):
         max_tokens=max_tokens,
         streaming=True,
     )
+    if st.session_state.deep_thinking:
+        llm_kwargs["reasoning_effort"] = "high"
+    llm = ChatOpenAI(**llm_kwargs)
 
     # ============================================================
     # 流式响应（RunnableWithMessageHistory 管理历史）
