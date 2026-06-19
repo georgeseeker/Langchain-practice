@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import uuid
 
 import streamlit as st
@@ -8,7 +9,7 @@ from langchain_classic.chains import (
     create_retrieval_chain,
 )
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_community.chat_message_histories import FileChatMessageHistory
 from langchain_core.embeddings import Embeddings
 from langchain_core.messages import HumanMessage
 from langchain_core.output_parsers import StrOutputParser
@@ -81,13 +82,12 @@ def load_knowledge_batch(filenames: list[str]) -> list[str]:
     return all_entries
 
 # ============================================================
-def get_session_history(session_id: str) -> ChatMessageHistory:
-    """按 session_id 存取对话历史（框架自动调用）。"""
-    if "history_store" not in st.session_state:
-        st.session_state.history_store = {}
-    if session_id not in st.session_state.history_store:
-        st.session_state.history_store[session_id] = ChatMessageHistory()
-    return st.session_state.history_store[session_id]
+def get_session_history(session_id: str) -> FileChatMessageHistory:
+    """按 session_id 存取对话历史，保存在本地 JSON 文件中。"""
+    os.makedirs("chat_history", exist_ok=True)
+    return FileChatMessageHistory(
+        file_path=f"chat_history/{session_id}.json",
+    )
 
 
 class LocalEmbeddings(Embeddings):
@@ -117,9 +117,14 @@ def build_retriever(knowledge: list[str], top_k: int = 3):
     )
 
 
-# 初始化 session state
+# 初始化 session state（优先从 URL 参数读取，支持找回历史）
 if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4())
+    sid = st.query_params.get("session")
+    if sid:
+        st.session_state.session_id = sid
+    else:
+        st.session_state.session_id = str(uuid.uuid4())
+        st.query_params["session"] = st.session_state.session_id
 if "current_prompt" not in st.session_state:
     st.session_state.current_prompt = "通用助手"
 if "custom_prompt_text" not in st.session_state:
@@ -156,7 +161,7 @@ with st.sidebar:
     model = st.selectbox(
         "模型",
         ["deepseek-v4-flash", "deepseek-v4-pro"],
-        index=1,
+        index=0,
     )
     temperature = st.slider("Temperature", 0.0, 2.0, 1.0, 0.1)
     max_tokens = st.slider("Max Tokens", 256, 8192, 2048, 256)
@@ -290,6 +295,9 @@ if prompt := st.chat_input("输入你的问题..."):
     )
     if st.session_state.deep_thinking:
         llm_kwargs["reasoning_effort"] = "high"
+        llm_kwargs["extra_body"] = {"thinking": {"type": "enabled"}} # type: ignore
+    else:
+        llm_kwargs["extra_body"] = {"thinking": {"type": "disabled"}} # type: ignore
     llm = ChatOpenAI(**llm_kwargs)
 
     # ============================================================
