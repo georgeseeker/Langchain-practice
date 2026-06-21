@@ -11,6 +11,8 @@ agent = create_agent(
         base_url="https://api.deepseek.com",
         model="deepseek-v4-flash",
         temperature=0.7,
+        reasoning_effort="high",
+        extra_body={"thinking": {"type": "enabled"}},
     ),
     tools=[],
     system_prompt="你是一个有帮助的助手。"
