@@ -5,7 +5,8 @@ from pydantic import SecretStr
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langchain_core.callbacks import CallbackManagerForLLMRun
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.outputs import ChatGenerationChunk
 
 _api_key = os.environ.get("DEEPSEEK_API_KEY")
 DEEPSEEK_API_KEY = SecretStr(_api_key) if _api_key else None
@@ -57,6 +58,80 @@ class DeepSeekChatOpenAI(ChatOpenAI):
 
         return result
 
+    def _stream(
+        self,
+        messages: list,
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        *,
+        stream_usage: Optional[bool] = None,
+        **kwargs: Any,
+    ):
+        """流式版本，逐 token 产出并捕获 reasoning_content。"""
+        self._ensure_sync_client_available()
+        import openai
+        from langchain_openai.chat_models.base import (
+            _handle_openai_bad_request,
+            _handle_openai_api_error,
+        )
+
+        kwargs["stream"] = True
+        stream_usage = self._should_stream_usage(stream_usage, **kwargs)
+        if stream_usage:
+            kwargs["stream_options"] = {"include_usage": stream_usage}
+        payload = self._get_request_payload(messages, stop=stop, **kwargs)
+        default_chunk_class: type = AIMessageChunk
+        base_generation_info = {}
+
+        try:
+            response = self.client.create(**payload)
+            with response as stream:
+                is_first_chunk = True
+                reasoning_pieces: list[str] = []
+                for chunk in stream:
+                    if not isinstance(chunk, dict):
+                        chunk = chunk.model_dump()
+
+                    # 提取 reasoning_content（DeepSeek 专有字段）
+                    reasoning_chunk = None
+                    try:
+                        choices = chunk.get("choices", [])
+                        if choices:
+                            delta = choices[0].get("delta", {})
+                            reasoning_chunk = delta.get("reasoning_content")
+                    except Exception:
+                        pass
+
+                    if reasoning_chunk:
+                        reasoning_pieces.append(reasoning_chunk)
+
+                    generation_chunk = self._convert_chunk_to_generation_chunk(
+                        chunk,
+                        default_chunk_class,
+                        base_generation_info if is_first_chunk else {},
+                    )
+                    if generation_chunk is None:
+                        continue
+
+                    default_chunk_class = generation_chunk.message.__class__
+
+                    if reasoning_pieces:
+                        generation_chunk.message.additional_kwargs["reasoning_content"] = "".join(reasoning_pieces)
+
+                    logprobs = (generation_chunk.generation_info or {}).get("logprobs")
+                    if run_manager:
+                        run_manager.on_llm_new_token(
+                            generation_chunk.text,
+                            chunk=generation_chunk,
+                            logprobs=logprobs,
+                        )
+                    is_first_chunk = False
+                    yield generation_chunk
+        except openai.BadRequestError as e:
+            _handle_openai_bad_request(e)
+        except openai.APIError as e:
+            _handle_openai_api_error(e)
+
 
 model = DeepSeekChatOpenAI(
     model="deepseek-v4-flash",
@@ -74,16 +149,36 @@ agent = create_agent(
 )
 
 if __name__ == "__main__":
-    result = agent.invoke({"messages": [{"role": "user", "content": "为什么大海是蓝色的？"}]})
+    import sys
 
-    for msg in result["messages"]:
-        if isinstance(msg, AIMessage):
-            reasoning = msg.additional_kwargs.get("reasoning_content")
-            if reasoning:
-                print("🤔 思维链：")
-                print(reasoning)
-                print("=" * 40)
-            print("💬 回答：" if reasoning else "", end="")
-            print(msg.content)
-        else:
-            print(f"[{msg.__class__.__name__}] {msg.content}")
+    print("🤔 思考中...")
+    print()
+
+    reasoning_seen = ""
+    content_started = False
+
+    for msg_chunk, metadata in agent.stream(
+        {"messages": [{"role": "user", "content": "为什么大海是蓝色的？"}]},
+        stream_mode="messages",
+    ):
+        if not isinstance(msg_chunk, AIMessageChunk):
+            continue
+
+        # 持续更新 reasoning（每个 chunk 携带的是累计值）
+        reasoning = msg_chunk.additional_kwargs.get("reasoning_content", "")
+        if reasoning:
+            reasoning_seen = reasoning
+
+        # 逐 token 打印回答
+        content = msg_chunk.content or ""
+        if content:
+            if not content_started:
+                if reasoning_seen:
+                    print("🧠 思维链：")
+                    print(reasoning_seen)
+                    print("=" * 40)
+                print("💬 回答：", end="", flush=True)
+                content_started = True
+            print(content, end="", flush=True)
+
+    print()
