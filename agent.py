@@ -6,7 +6,6 @@ from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.messages import AIMessage, AIMessageChunk
-from langchain_core.outputs import ChatGenerationChunk
 
 _api_key = os.environ.get("DEEPSEEK_API_KEY")
 DEEPSEEK_API_KEY = SecretStr(_api_key) if _api_key else None
@@ -149,7 +148,6 @@ agent = create_agent(
 )
 
 if __name__ == "__main__":
-    import sys
 
     print("🤔 思考中...")
     print()
