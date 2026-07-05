@@ -50,7 +50,7 @@ PROMPT_TEMPLATES = {
 # ============================================================
 # RAG 知识库（从 rag_library/ 读取）
 # ============================================================
-RAG_LIBRARY_DIR = os.path.join(os.path.dirname(__file__), "rag_library")
+RAG_LIBRARY_DIR = os.path.join(os.path.dirname(__file__), "../rag_library")
 
 
 def list_knowledge_bases() -> list[str]:
@@ -83,7 +83,7 @@ def load_knowledge_batch(filenames: list[str]) -> list[str]:
 # ============================================================
 def get_session_history(session_id: str) -> FileChatMessageHistory:
     """按 session_id 存取对话历史，保存在本地 JSON 文件中。"""
-    os.makedirs("chat_history", exist_ok=True)
+    os.makedirs("../chat_history", exist_ok=True)
     return FileChatMessageHistory(
         file_path=f"chat_history/{session_id}.json",
     )
