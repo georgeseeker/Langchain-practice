@@ -4,8 +4,7 @@ from pydantic import SecretStr
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
-from langchain_core.messages import AIMessage, ToolMessage, HumanMessage, SystemMessage
-
+from langchain_core.messages import HumanMessage
 from utils import clean_markdown
 
 _api_key = os.environ.get("DEEPSEEK_API_KEY")
@@ -28,13 +27,13 @@ model = ChatOpenAI(
 agent = create_agent(
     model=model,
     tools=[inclassroom],
-    system_prompt="你是一个有帮助的助手,回答问题不要加粗字体也就是别用*号包裹"
+    system_prompt="你是一个有帮助的助手"
 )
 
 if __name__ == "__main__":
 
     for chunk in agent.stream(
-        {"messages": [{"role": "user", "content": "老王在班级里吗？"}]},
+        {"messages": [HumanMessage(content="老王在班级里吗？")]},
         stream_mode="values"
     ):
         msg = chunk["messages"][-1]
