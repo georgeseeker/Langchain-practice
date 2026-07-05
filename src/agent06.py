@@ -20,10 +20,13 @@ from pydantic import SecretStr
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage
+from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_chroma import Chroma
 from langchain_core.embeddings import Embeddings
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.config import RunnableConfig
+from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_classic.chains import create_history_aware_retriever, create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from openai import OpenAI as OpenAIClient
@@ -37,6 +40,17 @@ DEEPSEEK_API_KEY = SecretStr(_api_key) if _api_key else None
 # 知识库路径
 # ============================================================
 RAG_LIBRARY_DIR = Path(__file__).parent.parent / "rag_library"
+
+# 内存对话历史（RunnableWithMessageHistory 用，不持久化）
+_SESSION_ID = "default"
+_session_histories: dict[str, InMemoryChatMessageHistory] = {}
+
+
+def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
+    """按 session_id 返回内存中的对话历史（同 Rag_project 接口，不落盘）。"""
+    if session_id not in _session_histories:
+        _session_histories[session_id] = InMemoryChatMessageHistory()
+    return _session_histories[session_id]
 
 
 def load_knowledge(filename: str) -> list[str]:
@@ -170,38 +184,51 @@ def build_rag_retrieval_chain(llm, retriever):
     return full_rag_chain
 
 
+_RAG_SYSTEM_PROMPT = "你是一位精通艾尔德兰大陆的博学学者，请基于提供的参考信息严谨回答。"
+
+
 @tool(description="调用完整的 RAG Chain（历史感知检索 + 文档整合 + 生成）。")
 def rag_retrieve_and_answer(question: str) -> str:
     """
     这个 Tool 只是个“壳”，里面真正跑的是上面 build_rag_retrieval_chain 返回的链。
+    对话历史由 RunnableWithMessageHistory 在内存中自动管理（同 Rag_project 写法，不落盘）。
     """
     if not _KNOWLEDGE:
         return "当前没有加载任何知识库数据。"
 
-    chat_history: list = []   # 演示用，单轮为空
-
     try:
         if _RETRIEVER is not None:
-            # ===== 关键：直接构建并调用原来的链式结构 =====
             rag_chain = build_rag_retrieval_chain(_chain_llm, _RETRIEVER)
-
-            result = rag_chain.invoke({
-                "input": question,
-                "chat_history": chat_history,
-                "system_prompt": "你是一位精通艾尔德兰大陆的博学学者，请基于提供的参考信息严谨回答。",
-            })
+            chain_with_history = RunnableWithMessageHistory(
+                rag_chain,
+                get_session_history,
+                input_messages_key="input",
+                history_messages_key="chat_history",
+                output_messages_key="answer",
+            )
+            result = chain_with_history.invoke(
+                {"input": question, "system_prompt": _RAG_SYSTEM_PROMPT},
+                config=RunnableConfig(configurable={"session_id": _SESSION_ID}),
+            )
             return result.get("answer", "RAG Chain 未返回答案")
 
-        else:
-            # 降级也保持链式风格
-            docs = _keyword_search(question)
-            context = "\n\n".join(docs) if docs else "无相关知识"
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", "基于知识回答问题：\n{context}"),
-                ("human", "{question}")
-            ])
-            simple_chain = prompt | _chain_llm
-            return simple_chain.invoke({"context": context, "question": question}).content
+        # 降级：关键词匹配 + 带历史的简单链
+        docs = _keyword_search(question)
+        context = "\n\n".join(docs) if docs else "无相关知识"
+        history = get_session_history(_SESSION_ID)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "基于知识回答问题：\n{context}"),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{question}"),
+        ])
+        answer = (prompt | _chain_llm).invoke({
+            "context": context,
+            "question": question,
+            "chat_history": history.messages,
+        }).content
+        history.add_user_message(question)
+        history.add_ai_message(answer)
+        return answer
 
     except Exception as e:
         return f"RAG Chain 执行失败: {e}"
@@ -295,49 +322,90 @@ def create_rag_agent(mode: str = "auto"):
 
 
 # ============================================================
-# 演示运行
+# 控制台交互
 # ============================================================
+_EXIT_COMMANDS = {"quit", "exit", "q", "退出", "bye"}
+_CLEAR_COMMANDS = {"清空", "clear", "reset"}
+
+
+def _extract_final_reply(messages: list) -> str:
+    """从 Agent 返回的消息列表中提取最终助手回复。"""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            content = clean_markdown(getattr(msg, "content", "") or "")
+            if content:
+                return content
+    return ""
+
+
+def _rag_tool_was_called(messages: list) -> bool:
+    """判断本轮是否调用了 RAG Tool（已由 RunnableWithMessageHistory 写入历史）。"""
+    return any(isinstance(msg, ToolMessage) for msg in messages)
+
+
+def run_console_chat(mode: str = "auto") -> None:
+    """交互式控制台对话。RAG 侧历史由 RunnableWithMessageHistory 在内存中管理。"""
+    agent = create_rag_agent(mode)
+    messages: list = []
+
+    while True:
+        try:
+            user_input = input("\n你: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n再见！")
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() in _EXIT_COMMANDS:
+            print("再见！")
+            break
+        if user_input.lower() in _CLEAR_COMMANDS:
+            get_session_history(_SESSION_ID).clear()
+            messages = []
+            print("对话历史已清空。")
+            continue
+
+        turn_start_len = len(messages)
+        messages.append(HumanMessage(content=user_input))
+
+        try:
+            for chunk in agent.stream(
+                {"messages": messages},
+                stream_mode="values",
+            ):
+                messages = chunk["messages"]
+                msg = messages[-1]
+                msg_type = type(msg).__name__
+                content = clean_markdown(getattr(msg, "content", "") or "")
+                if content:
+                    print(f"[{msg_type}] {content}")
+
+            # 未走 RAG Tool 时，同步写入内存历史，供后续 RAG 追问使用
+            turn_messages = messages[turn_start_len:]
+            if not _rag_tool_was_called(turn_messages):
+                reply = _extract_final_reply(turn_messages)
+                if reply:
+                    history = get_session_history(_SESSION_ID)
+                    history.add_user_message(user_input)
+                    history.add_ai_message(reply)
+
+        except Exception as e:
+            print(f"[错误] {e}")
+            messages = messages[:turn_start_len]
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("Agent06: Agentic RAG（方式1 - 把完整 retrieval_chain 包成 Tool）")
     print("重点：build_rag_retrieval_chain() 里就是原来的链式写法")
     print("知识库主题：艾尔德兰大陆（奇幻世界观）")
     print("支持模式：force_on / force_off / auto")
+    print("输入 quit / exit / 退出 结束对话；输入 清空 / clear 清除历史")
     print("=" * 70)
 
-    # 测试问题（同一个问题在不同模式下行为会不同）
-    test_queries = [
-        "大贤者梅林是谁？他有什么重要成就？",           # 知识库相关问题
-        "请用 Python 写一个计算斐波那契数列的函数。",   # 无关问题
-        "血月战争的起因是什么？",                       # 知识库相关
-    ]
+    mode_input = input("请选择知识库模式 [auto/force_on/force_off]（默认 auto）: ").strip().lower()
+    mode = mode_input if mode_input in ("force_on", "force_off", "auto") else "auto"
+    print(f"当前模式: {mode} - {get_mode_name(mode)}")
 
-    modes = ["force_on", "auto", "force_off"]
-
-    for mode in modes:
-        agent = create_rag_agent(mode)
-        mode_name = get_mode_name(mode)
-
-        print(f"\n{'='*70}")
-        print(f"【当前模式】{mode} - {mode_name}")
-        print(f"{'='*70}")
-
-        for q in test_queries:
-            print(f"\n>>> 用户问题: {q}")
-            print("-" * 50)
-
-            try:
-                for chunk in agent.stream(
-                    {"messages": [HumanMessage(content=q)]},
-                    stream_mode="values"
-                ):
-                    msg = chunk["messages"][-1]
-                    msg_type = type(msg).__name__
-                    content = clean_markdown(msg.content)
-                    if content:
-                        print(f"[{msg_type}] {content}")
-                print("-" * 50)
-            except Exception as e:
-                print(f"[错误] {e}")
-
-        print()
+    run_console_chat(mode)
