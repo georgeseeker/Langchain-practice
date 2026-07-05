@@ -3,4 +3,4 @@ __pycache__/
 .idea/
 chat_history/
 rag_library/
-/.claude/
+.claude/
