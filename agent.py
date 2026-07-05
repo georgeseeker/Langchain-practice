@@ -138,7 +138,7 @@ model = DeepSeekChatOpenAI(
     base_url="https://api.deepseek.com",
     temperature=0.7,
     reasoning_effort="high",
-    extra_body={"thinking": {"type": "enabled"}},
+    extra_body={"thinking": {"type": "enabled"}}
 )
 
 agent = create_agent(
