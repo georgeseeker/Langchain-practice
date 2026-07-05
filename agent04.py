@@ -1,17 +1,23 @@
 """
-Agent 中间件示例
-展示自定义日志中间件的效果
+Agent 中间件示例 - 装饰器写法
+使用 @before_agent, @after_agent, @before_model 等装饰器
 """
 import os
 from datetime import datetime
-from typing import Any, Dict
 
 from pydantic import SecretStr
-from langchain.agents import create_agent
-from langchain.agents.middleware import AgentMiddleware, HumanInTheLoopMiddleware
+from langchain.agents import create_agent, AgentState
+from langchain.agents.middleware import (
+    before_agent,
+    after_agent,
+    before_model,
+    after_model,
+    wrap_tool_call
+)
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
+from langgraph.runtime import Runtime
 from utils import clean_markdown
 
 _api_key = os.environ.get("DEEPSEEK_API_KEY")
@@ -31,36 +37,43 @@ def strlen(text: str) -> str:
 
 
 # ============================================
-# 自定义日志中间件
+# 使用装饰器定义中间件
 # ============================================
-class LoggingMiddleware(AgentMiddleware):
-    """日志中间件：记录每个执行步骤"""
 
-    def __init__(self):
-        self.call_count = 0
+@before_agent
+def log_before_agent(state: AgentState, runtime: Runtime) -> None:
+    """Agent 执行前调用"""
+    print(f"\n[装饰器中间件] === Agent 开始执行 ===")
+    print(f"[装饰器中间件] 当前消息数量: {len(state.get('messages', []))}")
 
-    def before_agent(self, state, runtime) -> dict | None:
-        """Agent 执行前"""
-        print(f"\n[日志中间件] === Agent 开始执行 ===")
-        return None
 
-    def before_model(self, state, runtime) -> dict | None:
-        """模型调用前"""
-        self.call_count += 1
-        print(f"[日志中间件] >>> 第 {self.call_count} 次模型调用")
-        return None
+@after_agent
+def log_after_agent(state: AgentState, runtime: Runtime) -> None:
+    """Agent 执行后调用"""
+    print(f"[装饰器中间件] === Agent 执行完成 ===")
+    print(f"[装饰器中间件] 最终消息数量: {len(state.get('messages', []))}")
 
-    def after_model(self, state, runtime) -> dict | None:
-        """模型调用后"""
-        print(f"[日志中间件] <<< 模型调用完成")
-        return None
 
-    def wrap_tool_call(self, request, handler):
-        """工具调用包装"""
-        print(f"[日志中间件] >>> 调用工具: {request.tool_call.get('name', 'unknown')}")
-        result = handler(request)
-        print(f"[日志中间件] <<< 工具返回完成")
-        return result
+@before_model
+def log_before_model(state: AgentState, runtime: Runtime) -> None:
+    """模型调用前"""
+    print(f"[装饰器中间件] >>> 模型开始思考...")
+
+
+@after_model
+def log_after_model(state: AgentState, runtime: Runtime) -> None:
+    """模型调用后"""
+    print(f"[装饰器中间件] <<< 模型思考完成")
+
+
+@wrap_tool_call
+def monitor_tool(request, handler):
+    """工具调用包装"""
+    tool_name = request.tool_call.get("name", "unknown")
+    print(f"[装饰器中间件] >>> 调用工具: {tool_name}")
+    result = handler(request)
+    print(f"[装饰器中间件] <<< 工具 {tool_name} 执行完成")
+    return result
 
 
 model = ChatOpenAI(
@@ -78,17 +91,23 @@ prompt = """你是一个有用的助手，可以使用工具来回答问题。
 
 请回答用户的问题。"""
 
-# 创建 Agent 并应用自定义中间件
+# 创建 Agent（装饰器自动注册到 middleware）
 agent = create_agent(
     model=model,
     tools=[get_time, strlen],
     system_prompt=prompt,
-    middleware=[LoggingMiddleware()]
+    middleware=[
+        log_before_agent,
+        log_after_agent,
+        log_before_model,
+        log_after_model,
+        monitor_tool,
+    ]
 )
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("中间件示例 - 日志记录")
+    print("中间件示例 - 装饰器写法")
     print("=" * 60)
 
     query = "现在几点了？"
